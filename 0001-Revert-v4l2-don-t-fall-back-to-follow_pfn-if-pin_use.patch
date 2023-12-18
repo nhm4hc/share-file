@@ -1,0 +1,65 @@
+From 3a864e787b47ff8764e66d6d918389e602766cdd Mon Sep 17 00:00:00 2001
+From: Hung Ngo <hung.manhngo@hitachivantara.com>
+Date: Mon, 18 Dec 2023 17:32:03 +0700
+Subject: [PATCH] Revert "v4l2: don't fall back to follow_pfn() if
+ pin_user_pages_fast() fails"
+
+This reverts commit d072a10c81d3a4f2308e24ffb4543a9146946373.
+---
+ mm/frame_vector.c | 31 +++++++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/mm/frame_vector.c b/mm/frame_vector.c
+index 0e589a9a8801..10f82d5643b6 100644
+--- a/mm/frame_vector.c
++++ b/mm/frame_vector.c
+@@ -37,6 +37,7 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	int ret = 0;
++	int err;
+ 	int locked;
+ 
+ 	if (nr_frames == 0)
+@@ -73,14 +74,32 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
+ 		vec->is_pfns = false;
+ 		ret = pin_user_pages_locked(start, nr_frames,
+ 			gup_flags, (struct page **)(vec->ptrs), &locked);
+-		if (likely(ret > 0))
+-			goto out;
++		goto out;
+ 	}
+ 
+-	/* This used to (racily) return non-refcounted pfns. Let people know */
+-	WARN_ONCE(1, "get_vaddr_frames() cannot follow VM_IO mapping");
+-	vec->nr_frames = 0;
+-
++	vec->got_ref = false;
++	vec->is_pfns = true;
++	do {
++		unsigned long *nums = frame_vector_pfns(vec);
++
++		while (ret < nr_frames && start + PAGE_SIZE <= vma->vm_end) {
++			err = follow_pfn(vma, start, &nums[ret]);
++			if (err) {
++				if (ret == 0)
++					ret = err;
++				goto out;
++			}
++			start += PAGE_SIZE;
++			ret++;
++		}
++		/*
++		 * We stop if we have enough pages or if VMA doesn't completely
++		 * cover the tail page.
++		 */
++		if (ret >= nr_frames || start < vma->vm_end)
++			break;
++		vma = find_vma_intersection(mm, start, start + 1);
++	} while (vma && vma->vm_flags & (VM_IO | VM_PFNMAP));
+ out:
+ 	if (locked)
+ 		mmap_read_unlock(mm);
+-- 
+2.25.1
+
