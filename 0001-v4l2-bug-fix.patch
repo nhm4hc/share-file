@@ -1,0 +1,169 @@
+From f8c9cee6b1ab55762104b88add44bb95a2e16ccb Mon Sep 17 00:00:00 2001
+From: Hung Ngo <hung.manhngo@hitachivantara.com>
+Date: Mon, 18 Dec 2023 17:52:32 +0700
+Subject: [PATCH] v4l2 bug fix
+
+---
+ ...t-fall-back-to-follow_pfn-if-pin_use.patch | 65 +++++++++++++++++++
+ .../0001-debugging-v4l2-issue.patch           | 63 ------------------
+ .../linux/linux-renesas_5.10.bb               |  2 +-
+ 3 files changed, 66 insertions(+), 64 deletions(-)
+ create mode 100644 meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-Revert-v4l2-don-t-fall-back-to-follow_pfn-if-pin_use.patch
+ delete mode 100644 meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-debugging-v4l2-issue.patch
+
+diff --git a/meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-Revert-v4l2-don-t-fall-back-to-follow_pfn-if-pin_use.patch b/meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-Revert-v4l2-don-t-fall-back-to-follow_pfn-if-pin_use.patch
+new file mode 100644
+index 00000000..926348e9
+--- /dev/null
++++ b/meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-Revert-v4l2-don-t-fall-back-to-follow_pfn-if-pin_use.patch
+@@ -0,0 +1,65 @@
++From 3a864e787b47ff8764e66d6d918389e602766cdd Mon Sep 17 00:00:00 2001
++From: Hung Ngo <hung.manhngo@hitachivantara.com>
++Date: Mon, 18 Dec 2023 17:32:03 +0700
++Subject: [PATCH] Revert "v4l2: don't fall back to follow_pfn() if
++ pin_user_pages_fast() fails"
++
++This reverts commit d072a10c81d3a4f2308e24ffb4543a9146946373.
++---
++ mm/frame_vector.c | 31 +++++++++++++++++++++++++------
++ 1 file changed, 25 insertions(+), 6 deletions(-)
++
++diff --git a/mm/frame_vector.c b/mm/frame_vector.c
++index 0e589a9a8801..10f82d5643b6 100644
++--- a/mm/frame_vector.c
+++++ b/mm/frame_vector.c
++@@ -37,6 +37,7 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
++ 	struct mm_struct *mm = current->mm;
++ 	struct vm_area_struct *vma;
++ 	int ret = 0;
+++	int err;
++ 	int locked;
++ 
++ 	if (nr_frames == 0)
++@@ -73,14 +74,32 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
++ 		vec->is_pfns = false;
++ 		ret = pin_user_pages_locked(start, nr_frames,
++ 			gup_flags, (struct page **)(vec->ptrs), &locked);
++-		if (likely(ret > 0))
++-			goto out;
+++		goto out;
++ 	}
++ 
++-	/* This used to (racily) return non-refcounted pfns. Let people know */
++-	WARN_ONCE(1, "get_vaddr_frames() cannot follow VM_IO mapping");
++-	vec->nr_frames = 0;
++-
+++	vec->got_ref = false;
+++	vec->is_pfns = true;
+++	do {
+++		unsigned long *nums = frame_vector_pfns(vec);
+++
+++		while (ret < nr_frames && start + PAGE_SIZE <= vma->vm_end) {
+++			err = follow_pfn(vma, start, &nums[ret]);
+++			if (err) {
+++				if (ret == 0)
+++					ret = err;
+++				goto out;
+++			}
+++			start += PAGE_SIZE;
+++			ret++;
+++		}
+++		/*
+++		 * We stop if we have enough pages or if VMA doesn't completely
+++		 * cover the tail page.
+++		 */
+++		if (ret >= nr_frames || start < vma->vm_end)
+++			break;
+++		vma = find_vma_intersection(mm, start, start + 1);
+++	} while (vma && vma->vm_flags & (VM_IO | VM_PFNMAP));
++ out:
++ 	if (locked)
++ 		mmap_read_unlock(mm);
++-- 
++2.25.1
++
+diff --git a/meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-debugging-v4l2-issue.patch b/meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-debugging-v4l2-issue.patch
+deleted file mode 100644
+index e1c4b87c..00000000
+--- a/meta-rcar-gen3/recipes-kernel/linux/linux-renesas/0001-debugging-v4l2-issue.patch
++++ /dev/null
+@@ -1,63 +0,0 @@
+-From 59f6f46303170aba0ae0be0f896138a4476434c2 Mon Sep 17 00:00:00 2001
+-From: Hung Ngo <hung.manhngo@hitachivantara.com>
+-Date: Mon, 18 Dec 2023 11:02:04 +0700
+-Subject: [PATCH] debugging v4l2 issue
+-
+----
+- mm/frame_vector.c | 16 ++++++++++++++--
+- 1 file changed, 14 insertions(+), 2 deletions(-)
+-
+-diff --git a/mm/frame_vector.c b/mm/frame_vector.c
+-index 0e589a9a8801..c1971424545c 100644
+---- a/mm/frame_vector.c
+-+++ b/mm/frame_vector.c
+-@@ -8,6 +8,8 @@
+- #include <linux/pagemap.h>
+- #include <linux/sched.h>
+- 
+-+#define DEBUG
+-+
+- /**
+-  * get_vaddr_frames() - map virtual addresses to pfns
+-  * @start:	starting user address
+-@@ -38,7 +40,11 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
+- 	struct vm_area_struct *vma;
+- 	int ret = 0;
+- 	int locked;
+--
+-+	
+-+	/* At the beginning of the function */
+-+    pr_info("get_vaddr_frames entry: start=%lu, nr_frames=%u, vec->nr_allocated=%u, vec->nr_frames=%u, vec->got_ref=%d, vec->is_pfns=%d\n",
+-+            start, nr_frames, vec->nr_allocated, vec->nr_frames, vec->got_ref, vec->is_pfns);
+-+	
+- 	if (nr_frames == 0)
+- 		return 0;
+- 
+-@@ -73,10 +79,12 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
+- 		vec->is_pfns = false;
+- 		ret = pin_user_pages_locked(start, nr_frames,
+- 			gup_flags, (struct page **)(vec->ptrs), &locked);
+-+		pr_info("get_vaddr_frames: return of pin_user_pages_locked = %d \n",ret);
+- 		if (likely(ret > 0))
+- 			goto out;
+- 	}
+--
+-+	pr_info("get_vaddr_frames: vma=%p, vm_flags=0x%lx, start=%lu, nr_frames=%lu, gup_flags=0x%x\n",
+-+         vma, vma->vm_flags, start, nr_frames, gup_flags);
+- 	/* This used to (racily) return non-refcounted pfns. Let people know */
+- 	WARN_ONCE(1, "get_vaddr_frames() cannot follow VM_IO mapping");
+- 	vec->nr_frames = 0;
+-@@ -88,6 +96,10 @@ int get_vaddr_frames(unsigned long start, unsigned int nr_frames,
+- 		ret = -EFAULT;
+- 	if (ret > 0)
+- 		vec->nr_frames = ret;
+-+	
+-+	/* At the end of the function, before returning */
+-+    pr_info("get_vaddr_frames exit: start=%lu, nr_frames=%u, vec->nr_allocated=%u, vec->nr_frames=%u, vec->got_ref=%d, vec->is_pfns=%d\n",
+-+            start, nr_frames, vec->nr_allocated, vec->nr_frames, vec->got_ref, vec->is_pfns);
+- 	return ret;
+- }
+- EXPORT_SYMBOL(get_vaddr_frames);
+--- 
+-2.25.1
+-
+diff --git a/meta-rcar-gen3/recipes-kernel/linux/linux-renesas_5.10.bb b/meta-rcar-gen3/recipes-kernel/linux/linux-renesas_5.10.bb
+index 257fbea7..0941a4cb 100644
+--- a/meta-rcar-gen3/recipes-kernel/linux/linux-renesas_5.10.bb
++++ b/meta-rcar-gen3/recipes-kernel/linux/linux-renesas_5.10.bb
+@@ -33,7 +33,7 @@ SRC_URI_append = " \
+ # Add module.lds
+ SRC_URI_append = " \
+     file://0001-scripts-Add-module.lds-to-fix-out-of-tree-modules-bu.patch \
+-	file://0001-debugging-v4l2-issue.patch \
++	file://0001-Revert-v4l2-don-t-fall-back-to-follow_pfn-if-pin_use.patch \
+ "
+ 
+ # Enable RPMSG_VIRTIO depend on ICCOM
+-- 
+2.25.1
+
